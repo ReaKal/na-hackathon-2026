@@ -1,31 +1,51 @@
 #!/usr/bin/env nextflow
 
-// WS1 skeleton: Input -> Conversion (T1) -> Core annotate+parse (T2) -> Exploration (T3).
-// See workflow.mmd for the diagram this implements.
+// End-to-end annotation pipeline:
+//   structure (.pdb|.cif) -> T1 CONVERT (MaxIT) -> T2 ANNOTATE (fr3d|rnapolis)
+//   -> T2 PARSE -> standardized base-pairing mmCIF (per tool)
+//   -> T3 VALIDATE (cross-tool comparison) + optional VISUALIZE (--visualize: per-tool graphs)
+//
+// Usage:
+//   nextflow run main.nf <structure.pdb|.cif>                              # both tools, default
+//   nextflow run main.nf --input <file> --annotators fr3d                  # single tool
+//   nextflow run main.nf --input <file> --annotators fr3d,rnapolis         # both tools + validate
+//
+// The per-tool annotated mmCIF is published to ${params.outdir}/basepairs/${tool}_basepairs.cif.
 
 include { CONVERT  } from './modules/convert.nf'
-//include { GEMMI_CONVERTPDB2MMCIF  } from './modules/GEMMIconvertpdb2cif.nf'
 include { ANNOTATE } from './modules/annotate.nf'
 include { PARSE    } from './modules/parse.nf'
-include { VALIDATE } from './modules/validate.nf'
+include { VALIDATE; VISUALIZE } from './modules/validate.nf'
 
 workflow {
-    if( !params.input )
-        error "No input. Use --input <structure.pdb|.cif>  (or -profile test for the bundled 9CFN)"
+    def input = params.input ?: ( args ? args[0] : null )
+    if( !input )
+        error "No input. Pass a structure positionally (nextflow run main.nf <file>) or with --input <file>  (or -profile test for the bundled 9CFN)"
 
-    // Input
-    structure_ch = Channel.fromPath(params.input, checkIfExists: true)
+    def tools = params.annotators.tokenize(',')*.trim().findAll { it }
+    if( !tools )
+        error "No annotators selected. Set --annotators fr3d (or rnapolis, or fr3d,rnapolis)."
+
+    structure_ch = Channel.fromPath(input, checkIfExists: true)
 
     // T1 Conversion: any structure -> standardized mmCIF
     mmcif_ch = CONVERT(structure_ch)
 
-    // T2 Core: run each selected annotator on the mmCIF
-    tools_ch = Channel.fromList( params.annotators.tokenize(',')*.trim() )
+    // T2 Annotate: one process per selected tool
+    tools_ch = Channel.fromList(tools)
     raw_ch   = ANNOTATE( tools_ch.combine(mmcif_ch) )
 
-    // T2 Parser: tool-native output -> standardized base-pairing mmCIF
+    // T2 Parse: tool-native output -> standardized base-pairing mmCIF
     bp_ch = PARSE( raw_ch )
 
-    // T3 Exploration: compare annotations across tools
+    bp_ch.view { tool, cif -> "[${tool}] annotated mmCIF -> ${cif}" }
+
+    // T3 Validate: cross-tool comparison — per-tool stats always; the comparison is
+    // skipped when only one tool is selected (gated in ws1-validate).
     VALIDATE( bp_ch.map { tool, cif -> cif }.collect() )
+
+    // T3 Visualize (optional, --visualize): per-tool base-pair export — CSV/TSV tables
+    // plus a forgi BulgeGraph (.bg) and a matplotlib render (.jpg).
+    if( params.visualize )
+        VISUALIZE( bp_ch )
 }
